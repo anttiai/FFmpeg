@@ -42,6 +42,9 @@
 #include "atsc_a53.h"
 #include "sei.h"
 
+#include "bpm/bpm.h"
+
+
 #if defined(X265_ENABLE_ALPHA) && MAX_LAYERS > 2
 #define FF_X265_MAX_LAYERS MAX_LAYERS
 #elif X265_BUILD >= 210
@@ -782,6 +785,73 @@ static int libx265_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
                 sei->numPayloads++;
             }
         }
+
+
+
+    // Antti BPM
+    int is_keyframe = pic->pict_type == AV_PICTURE_TYPE_I; // Every frame is X264_TYPE_AUTO unless -force_key_frames:v:0 "expr:gte(t,n_forced*2)" is used
+    uint32_t fps = (uint32_t)avctx->framerate.num;
+    u_int32_t w = (u_int32_t)avctx->width;
+    u_int32_t h = (u_int32_t)avctx->height;
+    char result[20]; // enough for super HQ fingerprint.. e.g. 19200x10800@1200
+    sprintf(result, "hevc%ux%u@%u", w, h, fps); // e.g. avc1920x1080@60
+    int track_idx = bpm_get_track_index(result);
+
+    if (is_keyframe == 1) {
+        AVBufferRef *ts_buf;
+        AVBufferRef *sm_buf;
+        AVBufferRef *erm_buf;
+        av_log(ctx, AV_LOG_ERROR, "I-FRAME: width %d, fps %d \n", w, fps);
+
+        // TS
+        uint8_t* ts_data = NULL;
+        uint32_t ts_size = 0;
+        bpm_render_ts_ptr(0, 0, 0, 0, &ts_data, &ts_size);
+        ts_buf = av_buffer_alloc(ts_size);
+        memcpy(ts_buf->data, ts_data, ts_size);
+        bpm_destroy(ts_data);
+        AVFrameSideData *side_data_ts = av_frame_new_side_data_from_buf(pic, AV_FRAME_DATA_SEI_UNREGISTERED, ts_buf);
+        if (!side_data_ts) {
+            av_log(ctx, AV_LOG_ERROR, "Failed to add side data to frame, ts_buf\n");
+            av_buffer_unref(&ts_buf); // Free the buffer if side data creation fails
+        }
+
+        // SM
+        uint8_t* sm_data = NULL;
+        uint32_t sm_size = 0;
+        bpm_render_sm_ptr(track_idx, &sm_data, &sm_size);
+        sm_buf = av_buffer_alloc(sm_size);
+        memcpy(sm_buf->data, sm_data, sm_size);
+        bpm_destroy(sm_data);
+        AVFrameSideData *side_data_sm = av_frame_new_side_data_from_buf(pic, AV_FRAME_DATA_SEI_UNREGISTERED, sm_buf);
+        if (!side_data_sm) {
+            av_log(ctx, AV_LOG_ERROR, "Failed to add side data to frame, sm_buf\n");
+            av_buffer_unref(&sm_buf); // Free the buffer if side data creation fails
+        }
+
+        // ERM
+        uint8_t* erm_data = NULL;
+        uint32_t erm_size = 0;
+        bpm_render_erm_ptr(track_idx, &erm_data, &erm_size);
+        erm_buf = av_buffer_alloc(erm_size);
+
+        memcpy(erm_buf->data, erm_data, erm_size);
+        bpm_destroy(erm_data);
+        AVFrameSideData *side_data_erm = av_frame_new_side_data_from_buf(pic, AV_FRAME_DATA_SEI_UNREGISTERED, erm_buf);
+        if (!side_data_erm) {
+            av_log(ctx, AV_LOG_ERROR, "Failed to add side data to frame, erm_buf\n");
+            av_buffer_unref(&erm_buf); // Free the buffer if side data creation fails
+        }
+
+        bpm_print_state();
+    }
+
+    bpm_frame_encoded(track_idx);
+    // End of Antti BPM
+
+
+
+
 
         if (ctx->udu_sei) {
             for (i = 0; i < pic->nb_side_data; i++) {

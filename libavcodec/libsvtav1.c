@@ -42,6 +42,8 @@
 #include "avcodec.h"
 #include "profiles.h"
 
+#include "bpm/bpm.h"
+
 typedef enum eos_status {
     EOS_NOT_REACHED = 0,
     EOS_SENT,
@@ -535,6 +537,86 @@ static int eb_send_frame(AVCodecContext *avctx, const AVFrame *frame)
 
     if (avctx->gop_size == 1)
         headerPtr->pic_type = EB_AV1_KEY_PICTURE;
+
+
+
+
+
+    // Antti BPM
+    int is_keyframe = frame->pict_type == AV_PICTURE_TYPE_I; // Every frame is X264_TYPE_AUTO unless -force_key_frames:v:0 "expr:gte(t,n_forced*2)" is used
+    uint32_t fps = (uint32_t)avctx->framerate.num;
+    u_int32_t w = (u_int32_t)avctx->width;
+    u_int32_t h = (u_int32_t)avctx->height;
+    char result[20]; // enough for super HQ fingerprint.. e.g. 19200x10800@1200
+    sprintf(result, "av1%ux%u@%u", w, h, fps); // e.g. avc1920x1080@60
+    int track_idx = bpm_get_track_index(result);
+
+    if (is_keyframe == 1) {
+        AVBufferRef *ts_buf;
+        AVBufferRef *sm_buf;
+        AVBufferRef *erm_buf;
+        av_log(avctx, AV_LOG_ERROR, "I-FRAME: width %d, fps %d \n", w, fps);
+
+        // TS
+        uint8_t* ts_data = NULL;
+        uint32_t ts_size = 0;
+        bpm_render_ts_ptr(0, 0, 0, 0, &ts_data, &ts_size);
+        ts_buf = av_buffer_alloc(ts_size);
+        memcpy(ts_buf->data, ts_data, ts_size);
+        bpm_destroy(ts_data);
+        AVFrameSideData *side_data_ts = av_frame_new_side_data_from_buf(frame, EB_AV1_METADATA_TYPE_FRAME_SIZE, ts_buf);
+        if (!side_data_ts) {
+            av_log(avctx, AV_LOG_ERROR, "Failed to add side data to frame, ts_buf\n");
+            av_buffer_unref(&ts_buf); // Free the buffer if side data creation fails
+        }
+
+        // SM
+        uint8_t* sm_data = NULL;
+        uint32_t sm_size = 0;
+        bpm_render_sm_ptr(track_idx, &sm_data, &sm_size);
+        sm_buf = av_buffer_alloc(sm_size);
+        memcpy(sm_buf->data, sm_data, sm_size);
+        bpm_destroy(sm_data);
+        AVFrameSideData *side_data_sm = av_frame_new_side_data_from_buf(frame, EB_AV1_METADATA_TYPE_FRAME_SIZE, sm_buf);
+        if (!side_data_sm) {
+            av_log(avctx, AV_LOG_ERROR, "Failed to add side data to frame, sm_buf\n");
+            av_buffer_unref(&sm_buf); // Free the buffer if side data creation fails
+        }
+
+        // ERM
+        uint8_t* erm_data = NULL;
+        uint32_t erm_size = 0;
+        bpm_render_erm_ptr(track_idx, &erm_data, &erm_size);
+        erm_buf = av_buffer_alloc(erm_size);
+
+        memcpy(erm_buf->data, erm_data, erm_size);
+        bpm_destroy(erm_data);
+        AVFrameSideData *side_data_erm = av_frame_new_side_data_from_buf(frame, EB_AV1_METADATA_TYPE_FRAME_SIZE, erm_buf);
+        if (!side_data_erm) {
+            av_log(avctx, AV_LOG_ERROR, "Failed to add side data to frame, erm_buf\n");
+            av_buffer_unref(&erm_buf); // Free the buffer if side data creation fails
+        }
+
+        bpm_print_state();
+    }
+
+    bpm_frame_encoded(track_idx);
+
+    if (is_keyframe == 1) {
+        for (int i = 0; i < frame->nb_side_data; i++) {
+            sd = frame->side_data[i];
+            // av_log(avctx, AV_LOG_ERROR, "- Adding data to frame, size: %d\n", sd->size);
+            // OBS uses 6 that is EB_AV1_METADATA_TYPE_FRAME_SIZE in SVT. That doesn't get injected by SVT (1-2 works), so
+            // SVT-AV1 needs to be patched to support EB_AV1_METADATA_TYPE_FRAME_SIZE: https://github.com/anttiai/patches/tree/main/SVT-AV1
+            ret = svt_add_metadata(headerPtr, EB_AV1_METADATA_TYPE_FRAME_SIZE, sd->data, sd->size);
+            if (ret < 0)
+                return AVERROR(ENOMEM);
+        }
+    }
+    // End of Antti BPM
+
+
+
 
     sd = av_frame_get_side_data(frame, AV_FRAME_DATA_DOVI_METADATA);
     if (svt_enc->dovi.cfg.dv_profile && sd) {
